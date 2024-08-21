@@ -23,18 +23,12 @@ import {
   retrieverRef,
 } from '@genkit-ai/ai/retriever';
 import { genkitPlugin, PluginProvider } from '@genkit-ai/core';
-import { MilvusClient, DataType } from '@zilliz/milvus2-sdk-node';
-import { Md5 } from 'ts-md5';
+import { MilvusClient, ClientConfig } from '@zilliz/milvus2-sdk-node';
 import * as z from 'zod';
-import {
-  Pinecone,
-  PineconeConfiguration,
-  RecordMetadata,
-} from '@pinecone-database/pinecone';
-
 
 /**
  * Verify the data of indices and values in a pair
+ * TODO: Decide whether to use sparse or not
  */
 const SparseVectorSchema = z
   .object({
@@ -50,30 +44,56 @@ const SparseVectorSchema = z
     }
   );
 
+/**
+ * Define the retriever and indexer options schema
+ * TODO: check the parameters
+ */
 const MilvusRetrieverOptionsSchema = CommonRetrieverOptionsSchema.extend({
-  limit: z.number().max(1000),
-  namespace: z.string().optional(),
+  k: z.number().max(1000),
+  collectionName: z.string().optional(),
   filter: z.record(z.string(), z.any()).optional(),
-  // includeValues is always false
-  // includeMetadata is always true
   sparseVector: SparseVectorSchema.optional(),
 });
 
 const MilvusIndexerOptionsSchema = z.object({
-  namespace: z.string().optional(),
+  collectionName: z.string().optional(),
 });
 
 const TEXT_KEY = '_content';
 
+export const milvusRetrieverRef = (params: {
+  collectionName: string;
+  displayName?: string;
+}) => {
+  return retrieverRef({
+    name: `milvus/${params.collectionName}`,
+    info: {
+      label: params.displayName ?? `Milvus - ${params.collectionName}`,
+    },
+    configSchema: MilvusRetrieverOptionsSchema.optional(),
+  });
+};
+
+export const milvusIndexerRef = (params: {
+  collectionName: string;
+  displayName?: string;
+}) => {
+  return indexerRef({
+    name: `milvus/${params.collectionName}`,
+    info: {
+      label: params.displayName ?? `Milvus - ${params.collectionName}`,
+    },
+    configSchema: MilvusIndexerOptionsSchema.optional(),
+  });
+};
 
 /**
  * Milvus plugin that provides a milvus retriever and indexer.
  */
 export function milvus<EmbedderCustomOptions extends z.ZodTypeAny>(
   params: {
-    clientParams?: MilvusConfiguration;
-    collectio_name: string;
-    indexId: string;
+    clientParams?: ClientConfig;
+    collectionName: string;
     embedder: EmbedderArgument<EmbedderCustomOptions>;
     embedderOptions?: z.infer<EmbedderCustomOptions>;
   }[]
@@ -82,9 +102,8 @@ export function milvus<EmbedderCustomOptions extends z.ZodTypeAny>(
     'milvus',
     async (
       params: {
-        clientParams?: MilvusConfiguration;
-        indexId: string;
-        textKey?: string;
+        clientParams?: ClientConfig;
+        collectionName: string;
         embedder: EmbedderArgument<EmbedderCustomOptions>;
         embedderOptions?: z.infer<EmbedderCustomOptions>;
       }[]
@@ -96,40 +115,140 @@ export function milvus<EmbedderCustomOptions extends z.ZodTypeAny>(
   return plugin(params);
 }
 
+export default milvus;
 
 /**
- * Configures a Milvus retriever.
+ * Configures a Milvus vector store retriever.
  */
+export function configureMilvusRetriever<
+  EmbedderCustomOptions extends z.ZodTypeAny,
+>(params: {
+  collectionName: string;
+  clientParams?: ClientConfig;
+  textKey?: string;
+  embedder: EmbedderArgument<EmbedderCustomOptions>;
+  embedderOptions?: z.infer<EmbedderCustomOptions>;
+}) {
+  const { collectionName, embedder, embedderOptions } = {
+    ...params,
+  };
+  const milvusConfig = params.clientParams ?? getDefaultConfig();
+  const milvus = new MilvusClient(milvusConfig);
+  const textKey = params.textKey ?? TEXT_KEY;
+
+  return defineRetriever(
+    {
+      name: `milvus/${collectionName}`,
+      configSchema: MilvusRetrieverOptionsSchema,
+    },
+    async (content, options) => {
+      const queryEmbeddings = await embed({
+        embedder,
+        content,
+        options: embedderOptions,
+      });
+
+      const response = await milvus.search({
+        collection_name: collectionName,
+        vector: queryEmbeddings,
+        limit: options.limit,
+        params: JSON.stringify(options.filter),
+      });
+
+      return {
+        documents: response.results
+          .map((result) => result.entity.value)
+          .filter((m): m is RecordMetadata => !!m)
+          .map((m) => {
+            const metadata = m;
+            const content = metadata[textKey] as string;
+            delete metadata[textKey];
+            return Document.fromText(content, metadata).toJSON();
+          }),
+      };
+    }
+  );
+}
 
 /**
- * Configures a Milvus Collection.
- * Store document data into an existing collection
+ * Configures a Milvus indexer.
  */
+export function configureMilvusIndexer<
+  EmbedderCustomOptions extends z.ZodTypeAny,
+>(params: {
+  collectionName: string;
+  clientParams?: ClientConfig;
+  textKey?: string;
+  embedder: EmbedderArgument<EmbedderCustomOptions>;
+  embedderOptions?: z.infer<EmbedderCustomOptions>;
+}) {
+  const { collectionName, embedder, embedderOptions } = params;
+  const milvusConfig = params.clientParams ?? getDefaultConfig();
+  const milvus = new MilvusClient(milvusConfig);
+  const textKey = params.textKey ?? TEXT_KEY;
 
+  return defineIndexer(
+    {
+      name: `milvus/${collectionName}`,
+      configSchema: MilvusIndexerOptionsSchema.optional(),
+    },
+    async (docs, options) => {
+      const embeddings = await Promise.all(
+        docs.map((doc) =>
+          embed({
+            embedder,
+            content: doc,
+            options: embedderOptions,
+          })
+        )
+      );
+
+      await milvus.insert({
+        collection_name: collectionName,
+        fields_data: embeddings.map((value, i) => {
+          const metadata: RecordMetadata = {
+            ...docs[i].metadata,
+          };
+          metadata[textKey] = docs[i].text();
+          return {
+            id: docs[i].id ?? String(i),
+            vector: value,
+            metadata,
+          };
+        }),
+      });
+    }
+  );
+}
 
 /**
  * Helper function for creating a Milvus Collection.
  */
 export async function createMilvusCollection(params: {
-  clientParams?: MilvusConfiguration;
-  options: CreateCollectionOptions;
+  clientParams?: ClientConfig;
+  options: {
+    collection_name: string,
+    dimension: number,
+    enable_dynamic_field: true,
+  };
 }) {
   const milvusConfig = params.clientParams ?? getDefaultConfig();
+  const collectionConfig = params.options;
   const milvus = new MilvusClient(milvusConfig);
-  return await milvus.createCollection(params.options);
+  return await milvus.createCollection(collectionConfig);
 }
 
 /**
  * Helper function to describe a Milvus Collection. Use it to check if a newly created index is ready for use.
  */
 export async function describeMilvusCollection(params: {
-  clientParams?: MilvusConfiguration;
+  clientParams?: ClientConfig;
   collectionName: string;
 }) {
   const milvusConfig = params.clientParams ?? getDefaultConfig();
   const milvus = new MilvusClient(milvusConfig);
   return await milvus.describeCollection({
-    collection_name: params.collectionName
+    collection_name: params.collectionName,
   });
 }
 
@@ -137,7 +256,7 @@ export async function describeMilvusCollection(params: {
  * Helper function for deleting Milvus collection.
  */
 export async function deleteMilvusCollection(params: {
-  clientParams?: MilvusConfiguration;
+  clientParams?: ClientConfig;
   collectionName: string;
 }) {
   const milvusConfig = params.clientParams ?? getDefaultConfig();
@@ -145,7 +264,7 @@ export async function deleteMilvusCollection(params: {
 
   try {
     return await milvus.dropCollection({
-      collection_name: params.collectionName
+      collection_name: params.collectionName,
     });
   } catch (error) {
     console.error('Failed to delete Milvus collection:', error);
@@ -153,19 +272,16 @@ export async function deleteMilvusCollection(params: {
   }
 }
 
-function getDefaultConfig() {
-  const configOrAddress = process.env.MILVUS_URI;
-  if (!configOrAddress)
-    throw new Error(
-      'Please pass in the address or set MILVUS_URI environment variable.\n'
-    );
-  return { configOrAddress: configOrAddress } as MilvusConfiguration;
+/**
+ * Get Default config.
+ */
+function getDefaultConfig(): ClientConfig {
+  const configOrAddress = process.env.MILVUS_URI ?? "http://localhost:19530";
+
+  return {
+    address: configOrAddress,
+    token: "",  // Default token is an empty string
+    username: "",  // Default username is an empty string
+    password: ""  // Default password is an empty string
+  };
 }
-
-
-
-
-
-
-
-
