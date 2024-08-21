@@ -23,43 +23,33 @@ import {
   retrieverRef,
 } from '@genkit-ai/ai/retriever';
 import { genkitPlugin, PluginProvider } from '@genkit-ai/core';
-import { MilvusClient, ClientConfig } from '@zilliz/milvus2-sdk-node';
+import { ClientConfig, MilvusClient } from '@zilliz/milvus2-sdk-node';
 import * as z from 'zod';
 
 /**
  * Verify the data of indices and values in a pair
- * TODO: Decide whether to use sparse or not
+ * TODO: Check the DocumentSchema fit the needs of users
  */
-const SparseVectorSchema = z
-  .object({
-    indices: z.number().array(),
-    values: z.number().array(),
-  })
-  .refine(
-    (input) => {
-      return input.indices.length === input.values.length;
-    },
-    {
-      message: 'Indices and values must be of the same length',
-    }
-  );
+export const DocumentSchema = z.object({
+  id: z.number(),
+  vector: z.array(z.number()),
+  metadata: z.record(z.string(), z.any()).optional(),
+});
 
 /**
  * Define the retriever and indexer options schema
- * TODO: check the parameters
+ * TODO: Check the parameters
  */
 const MilvusRetrieverOptionsSchema = CommonRetrieverOptionsSchema.extend({
-  k: z.number().max(1000),
+  k: z.number().max(1000).default(10),
   collectionName: z.string().optional(),
   filter: z.record(z.string(), z.any()).optional(),
-  sparseVector: SparseVectorSchema.optional(),
+  document: z.array(DocumentSchema),
 });
 
 const MilvusIndexerOptionsSchema = z.object({
   collectionName: z.string().optional(),
 });
-
-const TEXT_KEY = '_content';
 
 export const milvusRetrieverRef = (params: {
   collectionName: string;
@@ -119,6 +109,7 @@ export default milvus;
 
 /**
  * Configures a Milvus vector store retriever.
+ * TODO: change to milvus style
  */
 export function configureMilvusRetriever<
   EmbedderCustomOptions extends z.ZodTypeAny,
@@ -172,6 +163,7 @@ export function configureMilvusRetriever<
 
 /**
  * Configures a Milvus indexer.
+ * TODO: change to milvus style
  */
 export function configureMilvusIndexer<
   EmbedderCustomOptions extends z.ZodTypeAny,
@@ -227,9 +219,9 @@ export function configureMilvusIndexer<
 export async function createMilvusCollection(params: {
   clientParams?: ClientConfig;
   options: {
-    collection_name: string,
-    dimension: number,
-    enable_dynamic_field: true,
+    collection_name: string;
+    dimension: number;
+    enable_dynamic_field: true;
   };
 }) {
   const milvusConfig = params.clientParams ?? getDefaultConfig();
@@ -276,12 +268,12 @@ export async function deleteMilvusCollection(params: {
  * Get Default config.
  */
 function getDefaultConfig(): ClientConfig {
-  const configOrAddress = process.env.MILVUS_URI ?? "http://localhost:19530";
+  const configOrAddress = process.env.MILVUS_URI ?? 'http://localhost:19530';
 
   return {
     address: configOrAddress,
-    token: "",  // Default token is an empty string
-    username: "",  // Default username is an empty string
-    password: ""  // Default password is an empty string
+    token: '', // Default token is an empty string
+    username: '', // Default username is an empty string
+    password: '', // Default password is an empty string
   };
 }
